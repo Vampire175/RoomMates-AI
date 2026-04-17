@@ -3,94 +3,42 @@ package com.vampire175.roommatesai.GestureControls
 import android.util.Log
 import com.vampire175.roommatesai.Bluetooth.BluetoothManager
 import com.vampire175.roommatesai.GestureControls.fragment.CameraFragment
-import kotlinx.coroutines.*
 
-class GetFingerDataAndWrite(private val cameraFragement: CameraFragment) {
+class GetFingerDataAndWrite(private val cameraFragment: CameraFragment) {
 
-
-    private val gestureShowDelay: Long = 3000  // 3 seconds
+    private val gestureShowDelay: Long = 3000
     private var lastGestureTime: Long = 0L
     private var lastGesture: String = ""
-    var started: Boolean=false
+    var started: Boolean = false
 
     fun doTaskAccordingToGesture(gestureName: String?) {
-
-
-        var fingerStates = listOf(0, 0, 0, 0, 0)
         if (gestureName == null) return
 
         val currentTime = System.currentTimeMillis()
 
-        // Only react if enough time passed AND gesture changed
         if (gestureName != lastGesture && currentTime - lastGestureTime > gestureShowDelay) {
+            started = true
 
-
-
-            if (gestureName == "start"&&!started) {
-                cameraFragement.activity?.runOnUiThread {
-                    cameraFragement.ChangeHGRStartedText(true)
-                }
-
-                started=true
-                fingerStates = listOf(1, 1, 1, 1, 1)
-
-                if (BluetoothManager.isConnected()) {
-                    BluetoothManager.sendStates(fingerStates)
-                    Log.d("Gesture", "Sent START gesture via Bluetooth")
-
-
-                } else {
-                    Log.e("Gesture", "Bluetooth not connected")
-                }
+            val fingerStates = when (gestureName) {
+                "index"     -> listOf(0, 1, 1, 1, 1)
+                "middle"    -> listOf(0, 0, 1, 1, 1)
+                "ring"      -> listOf(0, 0, 0, 1, 1)
+                "pinky"     -> listOf(0, 0, 0, 0, 1)
+                "openpalm"  -> listOf(0, 0, 0, 0, 0)
+                "closepalm" -> listOf(1, 1, 1, 1, 1)
+                else        -> listOf(1, 1, 1, 1, 1)
             }
 
-            lastGesture = gestureName
-            lastGestureTime = currentTime
-        }
-
-        if(started){
-            if(gestureName=="index"){
-                fingerStates = listOf(0,1,1,1,1)
-
-            }
-            else if(gestureName=="middle"){
-                fingerStates = listOf(0,0,1,1,1)
-
-            }
-            else if(gestureName=="ring"){
-                fingerStates = listOf(0,0,0,1,1)
-
-            }
-            else if(gestureName=="pinky"){
-                fingerStates = listOf(0,0,0,0,1)
-
-            }
-            else if(gestureName=="openpalm"){
-                fingerStates = listOf(0,0,0,0,0)
-
-            }
-            else if(gestureName=="closepalm") {
-                fingerStates = listOf(1, 1, 1, 1, 1)
-            }
             if (BluetoothManager.isConnected()) {
                 BluetoothManager.sendStates(fingerStates)
-                Log.d("Gesture", "Sent START gesture via Bluetooth")
-
+                Log.d("Gesture", "Sent gesture '$gestureName' via Bluetooth")
             } else {
                 Log.e("Gesture", "Bluetooth not connected")
             }
 
-            CoroutineScope(Dispatchers.Main).launch {
 
-                delay(5000)
-                started=false
-                cameraFragement.ChangeHGRStartedText(false)
-            }
-
-
-        }
-        else{
-            //donothing
+            lastGesture = gestureName
+            lastGestureTime = currentTime
         }
     }
 }

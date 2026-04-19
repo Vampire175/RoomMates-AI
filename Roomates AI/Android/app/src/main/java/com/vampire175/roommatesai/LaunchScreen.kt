@@ -1,30 +1,26 @@
 package com.vampire175.roommatesai
 
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothSocket
+import android.content.Intent
+import android.os.Build
 import android.os.Bundle
-import androidx.activity.enableEdgeToEdge
+import android.widget.Button
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import android.widget.Button
-import android.content.Intent
-import com.vampire175.roommatesai.GestureControls.MainActivity
-import android.bluetooth.BluetoothSocket
-import java.io.OutputStream
-import android.widget.Toast
-import android.bluetooth.BluetoothAdapter
-import android.os.Build
-import androidx.appcompat.app.AlertDialog
-import android.annotation.SuppressLint
-import android.bluetooth.BluetoothDevice
-import android.media.MediaPlayer
-import android.telephony.SmsManager
-import java.util.UUID
+import androidx.activity.enableEdgeToEdge
 import com.vampire175.roommatesai.Bluetooth.BluetoothManager
-import com.vampire175.roommatesai.GestureControls.GetFingerDataAndWrite
+import com.vampire175.roommatesai.FaceRecognition.FaceRegistrationActivity   // ← NEW
+import com.vampire175.roommatesai.GestureControls.MainActivity
+import java.io.OutputStream
+import java.util.UUID
 
 class LaunchScreen : AppCompatActivity() {
-
-
 
     private var btSocket: BluetoothSocket? = null
     private var btOut: OutputStream? = null
@@ -34,28 +30,32 @@ class LaunchScreen : AppCompatActivity() {
         enableEdgeToEdge()
         setContentView(R.layout.activity_launch_screen)
 
-
-        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
+        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.register_face)) { v, insets ->
             val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             v.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom)
             insets
         }
 
+        // ── Existing: start gesture recognition ───────────────────────
         val hgstart: Button? = findViewById(R.id.hgstart)
         hgstart?.setOnClickListener {
-            val intent = Intent(this, MainActivity::class.java)
-            startActivity(intent)
+            startActivity(Intent(this, MainActivity::class.java))
         }
 
+        // ── Existing: Bluetooth connect ───────────────────────────────
         val connectButton: Button? = findViewById(R.id.connect)
-        connectButton?.setOnClickListener {
-            showBluetoothDeviceDialog()
+        connectButton?.setOnClickListener { showBluetoothDeviceDialog() }
+
+
+        val registerFaceButton: Button? = findViewById(R.id.register_face)
+        registerFaceButton?.setOnClickListener {
+            startActivity(Intent(this, FaceRegistrationActivity::class.java))
         }
 
         requestBtPermissionsIfNeeded()
     }
 
-    // ---------------- BLUETOOTH UI ----------------
+    // ── Bluetooth (unchanged) ─────────────────────────────────────────
 
     @SuppressLint("MissingPermission")
     private fun showBluetoothDeviceDialog() {
@@ -64,7 +64,6 @@ class LaunchScreen : AppCompatActivity() {
             Toast.makeText(this, "Bluetooth disabled", Toast.LENGTH_SHORT).show()
             return
         }
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             if (checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) !=
                 android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -72,77 +71,46 @@ class LaunchScreen : AppCompatActivity() {
                 return
             }
         }
-
         val devices = adapter.bondedDevices?.toList() ?: emptyList()
-
-        if (devices.isEmpty()) {
-            Toast.makeText(this, "No paired devices", Toast.LENGTH_SHORT).show()
-            return
-        }
-
+        if (devices.isEmpty()) { Toast.makeText(this, "No paired devices", Toast.LENGTH_SHORT).show(); return }
         val names = devices.map { "${it.name ?: "Unknown"} (${it.address})" }.toTypedArray()
-
         AlertDialog.Builder(this)
             .setTitle("Select Bluetooth device")
-            .setItems(names) { _, which ->
-                val device = devices[which]
-                connectToDevice(device)
-            }
+            .setItems(names) { _, which -> connectToDevice(devices[which]) }
             .show()
     }
-
-    // ---------------- CONNECT ----------------
 
     @SuppressLint("MissingPermission")
     private fun connectToDevice(device: BluetoothDevice) {
         Thread {
             try {
-                val uuid =
-                    UUID.fromString("00001101-0000-1000-8000-00805F9B34FB") // SPP UUID
-
+                val uuid   = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
                 val socket = device.createRfcommSocketToServiceRecord(uuid)
                 socket.connect()
-
                 btSocket = socket
-                btOut = socket.outputStream
-
-                // 🔹 Save globally
+                btOut    = socket.outputStream
                 BluetoothManager.btSocket = socket
-                BluetoothManager.btOut = socket.outputStream
-
+                BluetoothManager.btOut    = socket.outputStream
                 runOnUiThread {
-                    Toast.makeText(
-                        this,
-                        "Connected to ${device.name ?: "device"}",
-                        Toast.LENGTH_SHORT
-                    ).show()
+                    Toast.makeText(this, "Connected to ${device.name ?: "device"}", Toast.LENGTH_SHORT).show()
                 }
 
             } catch (e: Exception) {
                 runOnUiThread {
-                    Toast.makeText(
-                        this,
-                        "BT connect failed: ${e.message}",
-                        Toast.LENGTH_SHORT
-                    ).show()
+                    Toast.makeText(this, "BT connect failed: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
             }
         }.start()
     }
 
-    // ---------------- PERMISSIONS ----------------
-
     private fun requestBtPermissionsIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val perms = arrayOf(
-                android.Manifest.permission.BLUETOOTH_CONNECT,
-                android.Manifest.permission.BLUETOOTH_SCAN
+            requestPermissions(
+                arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT, android.Manifest.permission.BLUETOOTH_SCAN),
+                1001
             )
-            requestPermissions(perms, 1001)
         }
     }
-
-    // ---------------- CLEANUP ----------------
 
     override fun onDestroy() {
         super.onDestroy()
@@ -154,6 +122,4 @@ class LaunchScreen : AppCompatActivity() {
         super.onBackPressed()
         finish()
     }
-
-
 }

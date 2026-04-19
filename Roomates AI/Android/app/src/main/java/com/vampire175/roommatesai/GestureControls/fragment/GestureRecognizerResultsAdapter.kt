@@ -22,7 +22,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.google.mediapipe.tasks.components.containers.Category
 import java.util.Locale
 import kotlin.math.min
-import com.vampire175.roommatesai.GestureControls.GetFingerDataAndWrite
+import com.vampire175.roommatesai.Bluetooth.GetFingerDataAndWrite
 import com.vampire175.roommatesai.databinding.ItemGestureRecognizerResultBinding
 class GestureRecognizerResultsAdapter :
     RecyclerView.Adapter<GestureRecognizerResultsAdapter.ViewHolder>() {
@@ -30,9 +30,15 @@ class GestureRecognizerResultsAdapter :
         private const val NO_VALUE = "--"
     }
 
+    private var isVerified: Boolean=false
     private val helper = GetFingerDataAndWrite(CameraFragment())
     private var adapterCategories: MutableList<Category?> = mutableListOf()
     private var adapterSize: Int = 0
+
+
+        fun getVerified(isVerified: Boolean) {
+            this.isVerified = isVerified
+        }
 
     @SuppressLint("NotifyDataSetChanged")
     fun updateResults(categories: List<Category>?) {
@@ -67,9 +73,10 @@ class GestureRecognizerResultsAdapter :
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         adapterCategories[position].let { category ->
             holder.bind(category?.categoryName(), category?.score())
-            helper.doTaskAccordingToGesture(category?.categoryName())
+            helper.doTaskAccordingToGesture(category?.categoryName(),isVerified)
         }
     }
+
 
     override fun getItemCount(): Int = adapterCategories.size
 
@@ -87,4 +94,6 @@ class GestureRecognizerResultsAdapter :
             }
         }
     }
+
+
 }

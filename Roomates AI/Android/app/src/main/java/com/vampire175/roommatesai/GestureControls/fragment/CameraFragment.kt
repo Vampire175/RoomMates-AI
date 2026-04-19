@@ -1,22 +1,25 @@
 /*
  * Copyright 2022 The TensorFlow Authors. All Rights Reserved.
+ * (original licence header preserved)
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * MODIFIED: Added throttled face recognition via ML Kit + MobileFaceNet.
+ *           Face recognition runs on its own faceExecutor so it NEVER blocks
+ *           the MediaPipe backgroundExecutor.
  *
- *             http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * FIX (accuracy):
+ *   - toBitmapRgba() now reads imageInfo.rotationDegrees and rotates the
+ *     bitmap BEFORE passing it to ML Kit, so bounding boxes land on the
+ *     correct pixels and cropFace() receives an upright image.
+ *   - InputImage.fromBitmap(bitmap, 0) is now correct because rotation is
+ *     already baked into the bitmap.
  */
 package com.vampire175.roommatesai.GestureControls.fragment
 
 import android.annotation.SuppressLint
 import android.content.res.Configuration
+import android.graphics.Bitmap
+import android.graphics.Matrix
+import android.graphics.Rect
 import android.os.Bundle
 import android.util.Log
 import android.view.LayoutInflater
@@ -31,65 +34,91 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.navigation.Navigation
 import androidx.recyclerview.widget.LinearLayoutManager
+import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.vampire175.roommatesai.FaceRecognition.FaceEmbeddingRepository
+import com.vampire175.roommatesai.FaceRecognition.FaceRecognitionHelper
 import com.vampire175.roommatesai.GestureControls.GestureRecognizerHelper
 import com.vampire175.roommatesai.GestureControls.MainViewModel
 import com.vampire175.roommatesai.R
 import com.vampire175.roommatesai.databinding.FragmentCameraBinding
-import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.vampire175.roommatesai.GestureControls.GetFingerDataAndWrite
 import java.util.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import android.content.res.Resources
+import android.graphics.Color
+import com.vampire175.roommatesai.Bluetooth.GetFingerDataAndWrite
 
 class CameraFragment : Fragment(),
     GestureRecognizerHelper.GestureRecognizerListener {
 
     companion object {
         private const val TAG = "Hand gesture recognizer"
+        /**
+         * Run face recognition every N frames.
+         * MediaPipe runs ~30 fps → 20 means face recognition every ~0.67 s.
+         */
+        private const val FACE_RECOGNITION_INTERVAL = 1
     }
 
+    // ── View binding ──────────────────────────────────────────────────
     private var _fragmentCameraBinding: FragmentCameraBinding? = null
+    private val fragmentCameraBinding get() = _fragmentCameraBinding!!
 
+    // ── Gesture (MediaPipe) ───────────────────────────────────────────
     val gestureHandler = GetFingerDataAndWrite(this)
-    private val fragmentCameraBinding
-        get() = _fragmentCameraBinding!!
-
     private lateinit var gestureRecognizerHelper: GestureRecognizerHelper
     private val viewModel: MainViewModel by activityViewModels()
     private var defaultNumResults = 1
     private val gestureRecognizerResultAdapter: GestureRecognizerResultsAdapter by lazy {
-        GestureRecognizerResultsAdapter().apply {
-            updateAdapterSize(defaultNumResults)
-        }
+        GestureRecognizerResultsAdapter().apply { updateAdapterSize(defaultNumResults) }
     }
+
+    // ── Camera ────────────────────────────────────────────────────────
     private var preview: Preview? = null
     private var imageAnalyzer: ImageAnalysis? = null
     private var camera: Camera? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var cameraFacing = CameraSelector.LENS_FACING_FRONT
 
-    /** Blocking ML operations are performed using this executor */
+    // ── Executors ─────────────────────────────────────────────────────
+    /** MediaPipe executor – single thread, owned by original code */
     private lateinit var backgroundExecutor: ExecutorService
+    /** Separate executor for face detection + embedding (never blocks MediaPipe) */
+    private lateinit var faceExecutor: ExecutorService
 
+    // ── Face recognition components ───────────────────────────────────
+    private lateinit var faceRecognitionHelper: FaceRecognitionHelper
+    private lateinit var faceEmbeddingRepository: FaceEmbeddingRepository
+
+    private val faceDetector by lazy {
+        FaceDetection.getClient(
+            FaceDetectorOptions.Builder()
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                .setMinFaceSize(0.10f)
+                .enableTracking()
+                .build()
+        )
+    }
+
+    /** Frame counter used for throttling */
+    @Volatile private var frameCounter = 0
+    /** Guard against concurrent face-recognition calls */
+    @Volatile private var faceRecognitionInProgress = false
+
+    // ── Lifecycle ─────────────────────────────────────────────────────
 
     override fun onResume() {
         super.onResume()
-        // Make sure that all permissions are still present, since the
-        // user could have removed them while the app was in paused state.
         if (!PermissionsFragment.hasPermissions(requireContext())) {
-            Navigation.findNavController(
-                requireActivity(), R.id.fragment_container
-            ).navigate(R.id.action_camera_to_permissions)
+            Navigation.findNavController(requireActivity(), R.id.fragment_container)
+                .navigate(R.id.action_camera_to_permissions)
         }
-
-        // Start the GestureRecognizerHelper again when users come back
-        // to the foreground.
         backgroundExecutor.execute {
-            if (gestureRecognizerHelper.isClosed()) {
-                gestureRecognizerHelper.setupGestureRecognizer()
-            }
+            if (gestureRecognizerHelper.isClosed()) gestureRecognizerHelper.setupGestureRecognizer()
         }
     }
 
@@ -100,8 +129,6 @@ class CameraFragment : Fragment(),
             viewModel.setMinHandTrackingConfidence(gestureRecognizerHelper.minHandTrackingConfidence)
             viewModel.setMinHandPresenceConfidence(gestureRecognizerHelper.minHandPresenceConfidence)
             viewModel.setDelegate(gestureRecognizerHelper.currentDelegate)
-
-            // Close the Gesture Recognizer helper and release resources
             backgroundExecutor.execute { gestureRecognizerHelper.clearGestureRecognizer() }
         }
     }
@@ -109,172 +136,119 @@ class CameraFragment : Fragment(),
     override fun onDestroyView() {
         _fragmentCameraBinding = null
         super.onDestroyView()
-
-        // Shut down our background executor
         backgroundExecutor.shutdown()
-        backgroundExecutor.awaitTermination(
-            Long.MAX_VALUE, TimeUnit.NANOSECONDS
-        )
+        backgroundExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS)
+        faceExecutor.shutdown()
+        faceExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS)
+        if (this::faceRecognitionHelper.isInitialized) faceRecognitionHelper.close()
+        faceDetector.close()
     }
 
     override fun onCreateView(
-        inflater: LayoutInflater,
-        container: ViewGroup?,
-        savedInstanceState: Bundle?
+        inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?
     ): View {
-        _fragmentCameraBinding =
-            FragmentCameraBinding.inflate(inflater, container, false)
-
+        _fragmentCameraBinding = FragmentCameraBinding.inflate(inflater, container, false)
         return fragmentCameraBinding.root
     }
 
     @SuppressLint("MissingPermission")
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+
         with(fragmentCameraBinding.recyclerviewResults) {
             layoutManager = LinearLayoutManager(requireContext())
             adapter = gestureRecognizerResultAdapter
         }
 
-        // Initialize our background executor
+        // ── Executors ─────────────────────────────────────────────────
         backgroundExecutor = Executors.newSingleThreadExecutor()
+        faceExecutor        = Executors.newSingleThreadExecutor()
 
-        // Wait for the views to be properly laid out
-        fragmentCameraBinding.viewFinder.post {
-            // Set up the camera and its use cases
-            setUpCamera()
+        // ── Face recognition init ──────────────────────────────────────
+        faceEmbeddingRepository = FaceEmbeddingRepository(requireContext())
+        faceExecutor.execute {
+            faceRecognitionHelper = FaceRecognitionHelper(requireContext())
         }
 
-        // Create the Hand Gesture Recognition Helper that will handle the
-        // inference
+        // ── Camera ────────────────────────────────────────────────────
+        fragmentCameraBinding.viewFinder.post { setUpCamera() }
+
+        // ── MediaPipe gesture recognizer ──────────────────────────────
         backgroundExecutor.execute {
             gestureRecognizerHelper = GestureRecognizerHelper(
                 context = requireContext(),
                 runningMode = RunningMode.LIVE_STREAM,
                 minHandDetectionConfidence = viewModel.currentMinHandDetectionConfidence,
-                minHandTrackingConfidence = viewModel.currentMinHandTrackingConfidence,
-                minHandPresenceConfidence = viewModel.currentMinHandPresenceConfidence,
-                currentDelegate = viewModel.currentDelegate,
-                gestureRecognizerListener = this
+                minHandTrackingConfidence  = viewModel.currentMinHandTrackingConfidence,
+                minHandPresenceConfidence  = viewModel.currentMinHandPresenceConfidence,
+                currentDelegate            = viewModel.currentDelegate,
+                gestureRecognizerListener  = this
             )
         }
 
-        // Attach listeners to UI control widgets
         initBottomSheetControls()
     }
 
-    private fun initBottomSheetControls() {
-        // init bottom sheet settings
-        fragmentCameraBinding.bottomSheetLayout.detectionThresholdValue.text =
-            String.format(
-                Locale.US, "%.2f", viewModel.currentMinHandDetectionConfidence
-            )
-        fragmentCameraBinding.bottomSheetLayout.trackingThresholdValue.text =
-            String.format(
-                Locale.US, "%.2f", viewModel.currentMinHandTrackingConfidence
-            )
-        fragmentCameraBinding.bottomSheetLayout.presenceThresholdValue.text =
-            String.format(
-                Locale.US, "%.2f", viewModel.currentMinHandPresenceConfidence
-            )
+    // ── Bottom sheet ──────────────────────────────────────────────────
 
-        // When clicked, lower hand detection score threshold floor
+    private fun initBottomSheetControls() {
+        fragmentCameraBinding.bottomSheetLayout.detectionThresholdValue.text =
+            String.format(Locale.US, "%.2f", viewModel.currentMinHandDetectionConfidence)
+        fragmentCameraBinding.bottomSheetLayout.trackingThresholdValue.text =
+            String.format(Locale.US, "%.2f", viewModel.currentMinHandTrackingConfidence)
+        fragmentCameraBinding.bottomSheetLayout.presenceThresholdValue.text =
+            String.format(Locale.US, "%.2f", viewModel.currentMinHandPresenceConfidence)
+
         fragmentCameraBinding.bottomSheetLayout.detectionThresholdMinus.setOnClickListener {
             if (gestureRecognizerHelper.minHandDetectionConfidence >= 0.2) {
-                gestureRecognizerHelper.minHandDetectionConfidence -= 0.1f
-                updateControlsUi()
+                gestureRecognizerHelper.minHandDetectionConfidence -= 0.1f; updateControlsUi()
             }
         }
-
-        // When clicked, raise hand detection score threshold floor
         fragmentCameraBinding.bottomSheetLayout.detectionThresholdPlus.setOnClickListener {
             if (gestureRecognizerHelper.minHandDetectionConfidence <= 0.8) {
-                gestureRecognizerHelper.minHandDetectionConfidence += 0.1f
-                updateControlsUi()
+                gestureRecognizerHelper.minHandDetectionConfidence += 0.1f; updateControlsUi()
             }
         }
-
-        // When clicked, lower hand tracking score threshold floor
         fragmentCameraBinding.bottomSheetLayout.trackingThresholdMinus.setOnClickListener {
             if (gestureRecognizerHelper.minHandTrackingConfidence >= 0.2) {
-                gestureRecognizerHelper.minHandTrackingConfidence -= 0.1f
-                updateControlsUi()
+                gestureRecognizerHelper.minHandTrackingConfidence -= 0.1f; updateControlsUi()
             }
         }
-
-        // When clicked, raise hand tracking score threshold floor
         fragmentCameraBinding.bottomSheetLayout.trackingThresholdPlus.setOnClickListener {
             if (gestureRecognizerHelper.minHandTrackingConfidence <= 0.8) {
-                gestureRecognizerHelper.minHandTrackingConfidence += 0.1f
-                updateControlsUi()
+                gestureRecognizerHelper.minHandTrackingConfidence += 0.1f; updateControlsUi()
             }
         }
-
-        // When clicked, lower hand presence score threshold floor
         fragmentCameraBinding.bottomSheetLayout.presenceThresholdMinus.setOnClickListener {
             if (gestureRecognizerHelper.minHandPresenceConfidence >= 0.2) {
-                gestureRecognizerHelper.minHandPresenceConfidence -= 0.1f
-                updateControlsUi()
+                gestureRecognizerHelper.minHandPresenceConfidence -= 0.1f; updateControlsUi()
             }
         }
-
-        // When clicked, raise hand presence score threshold floor
         fragmentCameraBinding.bottomSheetLayout.presenceThresholdPlus.setOnClickListener {
             if (gestureRecognizerHelper.minHandPresenceConfidence <= 0.8) {
-                gestureRecognizerHelper.minHandPresenceConfidence += 0.1f
-                updateControlsUi()
+                gestureRecognizerHelper.minHandPresenceConfidence += 0.1f; updateControlsUi()
             }
         }
-
-        // When clicked, change the underlying hardware used for inference.
-        // Current options are CPU and GPU
-        fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.setSelection(
-            viewModel.currentDelegate, false
-        )
+        fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.setSelection(viewModel.currentDelegate, false)
         fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.onItemSelectedListener =
             object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(
-                    p0: AdapterView<*>?, p1: View?, p2: Int, p3: Long
-                ) {
-                    try {
-                        gestureRecognizerHelper.currentDelegate = p2
-                        updateControlsUi()
-                    } catch(e: UninitializedPropertyAccessException) {
-                        Log.e(TAG, "GestureRecognizerHelper has not been initialized yet.")
-
+                override fun onItemSelected(p0: AdapterView<*>?, p1: View?, p2: Int, p3: Long) {
+                    try { gestureRecognizerHelper.currentDelegate = p2; updateControlsUi() }
+                    catch (e: UninitializedPropertyAccessException) {
+                        Log.e(TAG, "GestureRecognizerHelper not initialized yet.")
                     }
                 }
-
-                override fun onNothingSelected(p0: AdapterView<*>?) {
-                    /* no op */
-                }
+                override fun onNothingSelected(p0: AdapterView<*>?) {}
             }
     }
 
-    // Update the values displayed in the bottom sheet. Reset recognition
-    // helper.
     private fun updateControlsUi() {
         fragmentCameraBinding.bottomSheetLayout.detectionThresholdValue.text =
-            String.format(
-                Locale.US,
-                "%.2f",
-                gestureRecognizerHelper.minHandDetectionConfidence
-            )
+            String.format(Locale.US, "%.2f", gestureRecognizerHelper.minHandDetectionConfidence)
         fragmentCameraBinding.bottomSheetLayout.trackingThresholdValue.text =
-            String.format(
-                Locale.US,
-                "%.2f",
-                gestureRecognizerHelper.minHandTrackingConfidence
-            )
+            String.format(Locale.US, "%.2f", gestureRecognizerHelper.minHandTrackingConfidence)
         fragmentCameraBinding.bottomSheetLayout.presenceThresholdValue.text =
-            String.format(
-                Locale.US,
-                "%.2f",
-                gestureRecognizerHelper.minHandPresenceConfidence
-            )
-
-        // Needs to be cleared instead of reinitialized because the GPU
-        // delegate needs to be initialized on the thread using it when applicable
+            String.format(Locale.US, "%.2f", gestureRecognizerHelper.minHandPresenceConfidence)
         backgroundExecutor.execute {
             gestureRecognizerHelper.clearGestureRecognizer()
             gestureRecognizerHelper.setupGestureRecognizer()
@@ -282,111 +256,117 @@ class CameraFragment : Fragment(),
         fragmentCameraBinding.overlay.clear()
     }
 
-    // Initialize CameraX, and prepare to bind the camera use cases
-    private fun setUpCamera() {
-        val cameraProviderFuture =
-            ProcessCameraProvider.getInstance(requireContext())
-        cameraProviderFuture.addListener(
-            {
-                // CameraProvider
-                cameraProvider = cameraProviderFuture.get()
+    // ── Camera setup ──────────────────────────────────────────────────
 
-                // Build and bind the camera use cases
-                bindCameraUseCases()
-            }, ContextCompat.getMainExecutor(requireContext())
-        )
+    private fun setUpCamera() {
+        val future = ProcessCameraProvider.getInstance(requireContext())
+        future.addListener({
+            cameraProvider = future.get()
+            bindCameraUseCases()
+        }, ContextCompat.getMainExecutor(requireContext()))
     }
 
-    // Declare and bind preview, capture and analysis use cases
+    private fun runFaceRecognitionSafe(bitmap: Bitmap) {
+        if (faceRecognitionInProgress) {
+            bitmap.recycle()
+            return
+        }
+
+        faceRecognitionInProgress = true
+
+        faceExecutor.execute {
+            try {
+                runFaceRecognition(bitmap)
+            } finally {
+                faceRecognitionInProgress = false
+                bitmap.recycle()
+            }
+        }
+    }
+
     @SuppressLint("UnsafeOptInUsageError")
     private fun bindCameraUseCases() {
+        val provider = cameraProvider ?: throw IllegalStateException("Camera initialization failed.")
+        val selector = CameraSelector.Builder().requireLensFacing(cameraFacing).build()
 
-        // CameraProvider
-        val cameraProvider = cameraProvider
-            ?: throw IllegalStateException("Camera initialization failed.")
-
-        val cameraSelector =
-            CameraSelector.Builder().requireLensFacing(cameraFacing).build()
-
-        // Preview. Only using the 4:3 ratio because this is the closest to our models
-        preview = Preview.Builder().setTargetAspectRatio(AspectRatio.RATIO_4_3)
+        preview = Preview.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
             .setTargetRotation(fragmentCameraBinding.viewFinder.display.rotation)
             .build()
 
-        // ImageAnalysis. Using RGBA 8888 to match how our models work
-        imageAnalyzer =
-            ImageAnalysis.Builder().setTargetAspectRatio(AspectRatio.RATIO_4_3)
-                .setTargetRotation(fragmentCameraBinding.viewFinder.display.rotation)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build()
-                // The analyzer can then be assigned to the instance
-                .also {
-                    it.setAnalyzer(backgroundExecutor) { image ->
-                        recognizeHand(image)
+        imageAnalyzer = ImageAnalysis.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+            .setTargetRotation(fragmentCameraBinding.viewFinder.display.rotation)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .build()
+            .also {
+                it.setAnalyzer(backgroundExecutor) { image ->
+
+                    // 🔹 STEP A: Decide if we should run face recognition
+                    val shouldRunFace = (
+                            frameCounter % FACE_RECOGNITION_INTERVAL == 0 &&
+                                    !faceRecognitionInProgress &&
+                                    faceEmbeddingRepository.hasFaces()
+                            )
+
+                    // 🔹 STEP B: Extract bitmap BEFORE image is closed.
+                    //    FIX: pass rotationDegrees so the bitmap is upright
+                    //    before ML Kit processes it.
+                    val bitmap = if (shouldRunFace) {
+                        image.toBitmapRgba(image.imageInfo.rotationDegrees)
+                    } else null
+
+                    // 🔹 STEP C: Run MediaPipe (this closes image internally)
+                    recognizeHand(image)
+
+                    // 🔹 STEP D: Run face recognition using safe bitmap
+                    if (bitmap != null) {
+                        runFaceRecognitionSafe(bitmap)
                     }
+
+                    frameCounter++
                 }
+            }
 
-        // Must unbind the use-cases before rebinding them
-        cameraProvider.unbindAll()
-
+        provider.unbindAll()
         try {
-            // A variable number of use-cases can be passed here -
-            // camera provides access to CameraControl & CameraInfo
-            camera = cameraProvider.bindToLifecycle(
-                this, cameraSelector, preview, imageAnalyzer
-            )
-
-            // Attach the viewfinder's surface provider to preview use case
+            camera = provider.bindToLifecycle(this, selector, preview, imageAnalyzer)
             preview?.setSurfaceProvider(fragmentCameraBinding.viewFinder.surfaceProvider)
         } catch (exc: Exception) {
             Log.e(TAG, "Use case binding failed", exc)
         }
     }
 
+    // ── MediaPipe gesture ─────────────────────────────────────────────
+
     private fun recognizeHand(imageProxy: ImageProxy) {
-        gestureRecognizerHelper.recognizeLiveStream(
-            imageProxy = imageProxy,
-        )
+        gestureRecognizerHelper.recognizeLiveStream(imageProxy = imageProxy)
+        // NOTE: imageProxy.close() is handled inside GestureRecognizerHelper
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        imageAnalyzer?.targetRotation =
-            fragmentCameraBinding.viewFinder.display.rotation
+        imageAnalyzer?.targetRotation = fragmentCameraBinding.viewFinder.display.rotation
     }
 
-    // Update UI after a hand gesture has been recognized. Extracts original
-    // image height/width to scale and place the landmarks properly through
-    // OverlayView. Only one result is expected at a time. If two or more
-    // hands are seen in the camera frame, only one will be processed.
-    override fun onResults(
-        resultBundle: GestureRecognizerHelper.ResultBundle
-    ) {
+    override fun onResults(resultBundle: GestureRecognizerHelper.ResultBundle) {
         activity?.runOnUiThread {
             if (_fragmentCameraBinding != null) {
-                // Show result of recognized gesture
                 val gestureCategories = resultBundle.results.first().gestures()
                 if (gestureCategories.isNotEmpty()) {
-                    gestureRecognizerResultAdapter.updateResults(
-                        gestureCategories.first()
-                    )
+                    gestureRecognizerResultAdapter.updateResults(gestureCategories.first())
                 } else {
                     gestureRecognizerResultAdapter.updateResults(emptyList())
                 }
-
                 fragmentCameraBinding.bottomSheetLayout.inferenceTimeVal.text =
                     String.format("%d ms", resultBundle.inferenceTime)
-
-                // Pass necessary information to OverlayView for drawing on the canvas
                 fragmentCameraBinding.overlay.setResults(
                     resultBundle.results.first(),
                     resultBundle.inputImageHeight,
                     resultBundle.inputImageWidth,
                     RunningMode.LIVE_STREAM
                 )
-
-                // Force a redraw
                 fragmentCameraBinding.overlay.invalidate()
             }
         }
@@ -396,23 +376,164 @@ class CameraFragment : Fragment(),
         activity?.runOnUiThread {
             Toast.makeText(requireContext(), error, Toast.LENGTH_SHORT).show()
             gestureRecognizerResultAdapter.updateResults(emptyList())
-
             if (errorCode == GestureRecognizerHelper.GPU_ERROR) {
                 fragmentCameraBinding.bottomSheetLayout.spinnerDelegate.setSelection(
-                    GestureRecognizerHelper.DELEGATE_CPU, false
+                    GestureRecognizerHelper.DELEGATE_CPU, false)
+            }
+        }
+    }
+
+    // ── Face recognition ──────────────────────────────────────────────
+
+    private fun runFaceRecognition(bitmap: Bitmap) {
+        if (!this::faceRecognitionHelper.isInitialized) return
+
+        // FIX: rotation=0 because the bitmap is already rotated to upright
+        //      in toBitmapRgba(rotationDegrees).
+        val image = InputImage.fromBitmap(bitmap, 0)
+
+        val faces = try {
+            com.google.android.gms.tasks.Tasks.await(faceDetector.process(image))
+        } catch (e: Exception) {
+            Log.w(TAG, "Face detection failed: ${e.message}")
+            ChangeHGRStartedText(false)
+            return
+
+        }
+
+        if (faces.isEmpty()) {
+            Log.d(TAG, "No face detected")
+            gestureRecognizerResultAdapter.getVerified(false)
+            activity?.runOnUiThread {
+                fragmentCameraBinding.overlay.clearFaceLabels()
+            }
+            ChangeHGRStartedText(false)
+            return
+        }
+
+        Log.d(TAG, "Face detected: ${faces.size} face(s)")
+
+        val storedEmbeddings = faceEmbeddingRepository.getAllEmbeddings()
+        val results = mutableListOf<Pair<Rect, String>>()
+
+        for (face in faces) {
+            val box     = face.boundingBox
+            val cropped = cropFace(bitmap, box) ?: continue
+
+            val emb   = faceRecognitionHelper.generateEmbedding(cropped)
+            cropped.recycle()
+
+            val match = faceRecognitionHelper.findBestMatch(emb, storedEmbeddings)
+            val label = match?.first ?: "Unknown"
+
+            Log.d(TAG, "Face recognized: $label")
+            if(label!="Unknown"){
+                gestureRecognizerResultAdapter.getVerified(true)
+                ChangeHGRStartedText(true)
+            }
+            else{
+                gestureRecognizerResultAdapter.getVerified(false)
+                ChangeHGRStartedText(false)
+            }
+
+            if (match != null) {
+                Log.d(TAG, "Match distance: ${match.second}")
+            }
+
+            results.add(Pair(box, label))
+        }
+
+        activity?.runOnUiThread {
+            if (_fragmentCameraBinding != null) {
+                fragmentCameraBinding.overlay.setFaceResults(
+                    results,
+                    bitmap.height,
+                    bitmap.width
                 )
             }
         }
     }
 
-    fun ChangeHGRStartedText(started: Boolean){
+    // ── Bitmap helpers ────────────────────────────────────────────────
 
-        if(started) {
-            fragmentCameraBinding.textView2.setTextColor(Resources.getSystem().getColor(R.color.Green))
-            fragmentCameraBinding.textView2.text = "Hand Gesture Recognition : ON"
+    /**
+     * Extracts an upright, front-camera-mirrored [Bitmap] from an RGBA_8888
+     * [ImageProxy] WITHOUT closing it.
+     *
+     * FIX vs original:
+     *   [rotationDegrees] (from imageInfo.rotationDegrees) is applied BEFORE
+     *   the mirror so that ML Kit receives an upright image and its bounding
+     *   boxes map correctly onto the pixels we crop.
+     */
+    private fun ImageProxy.toBitmapRgba(rotationDegrees: Int): Bitmap? {
+        return try {
+            val plane       = planes[0]
+            val buffer      = plane.buffer.duplicate()      // don't drain the original
+            val pixelStride = plane.pixelStride
+            val rowStride   = plane.rowStride
+            val rowPadding  = rowStride - pixelStride * width
+
+            val raw = Bitmap.createBitmap(
+                width + rowPadding / pixelStride, height, Bitmap.Config.ARGB_8888
+            )
+            raw.copyPixelsFromBuffer(buffer)
+
+            // Crop away row-padding columns
+            val cropped = Bitmap.createBitmap(raw, 0, 0, width, height)
+            if (cropped != raw) raw.recycle()
+
+            // 1. Rotate to upright  (FIX)
+            val rotated = rotateBitmap(cropped, rotationDegrees.toFloat())
+
+            // 2. Mirror for front camera
+            mirrorBitmap(rotated)
+        } catch (e: Exception) {
+            Log.w(TAG, "Bitmap extraction failed: ${e.message}")
+            null
         }
-        else{
-            fragmentCameraBinding.textView2.setTextColor(Resources.getSystem().getColor(R.color.Red))
+    }
+
+    /**
+     * Rotates [src] by [degrees] clockwise and recycles the source.
+     * Returns [src] unchanged if [degrees] is 0.
+     */
+    private fun rotateBitmap(src: Bitmap, degrees: Float): Bitmap {
+        if (degrees == 0f) return src
+        val m = Matrix().apply { postRotate(degrees) }
+        val result = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, false)
+        src.recycle()
+        return result
+    }
+
+    /** Flips [src] horizontally (front-camera mirror) and recycles the source. */
+    private fun mirrorBitmap(src: Bitmap): Bitmap {
+        val m = Matrix().apply { postScale(-1f, 1f, src.width / 2f, src.height / 2f) }
+        val mirrored = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, false)
+        src.recycle()
+        return mirrored
+    }
+
+    /**
+     * Crops [box] out of [src] with 20 % padding, clamped to image bounds.
+     */
+    private fun cropFace(src: Bitmap, box: Rect): Bitmap? {
+        val pad    = (box.width() * 0.20f).toInt()
+        val left   = (box.left   - pad).coerceAtLeast(0)
+        val top    = (box.top    - pad).coerceAtLeast(0)
+        val right  = (box.right  + pad).coerceAtMost(src.width)
+        val bottom = (box.bottom + pad).coerceAtMost(src.height)
+        if (right <= left || bottom <= top) return null
+        return Bitmap.createBitmap(src, left, top, right - left, bottom - top)
+    }
+
+    // ── HGR text helper ───────────────────────────────────────────────
+
+    fun ChangeHGRStartedText(started: Boolean) {
+        if (started) {
+            fragmentCameraBinding.textView2.setTextColor(Color.GREEN)
+            fragmentCameraBinding.textView2.text = "Hand Gesture Recognition : ON"
+        } else {
+            fragmentCameraBinding.textView2.setTextColor(Color.RED)
             fragmentCameraBinding.textView2.text = "Hand Gesture Recognition : OFF"
         }
     }

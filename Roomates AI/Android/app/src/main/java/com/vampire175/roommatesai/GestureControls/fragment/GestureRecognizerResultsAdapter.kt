@@ -31,7 +31,7 @@ class GestureRecognizerResultsAdapter :
     }
 
     private var isVerified: Boolean=false
-    private val helper = GetFingerDataAndWrite(CameraFragment())
+    private val helper = GetFingerDataAndWrite()
     private var adapterCategories: MutableList<Category?> = mutableListOf()
     private var adapterSize: Int = 0
 

@@ -69,7 +69,7 @@ class CameraFragment : Fragment(),
     private val fragmentCameraBinding get() = _fragmentCameraBinding!!
 
     // ── Gesture (MediaPipe) ───────────────────────────────────────────
-    val gestureHandler = GetFingerDataAndWrite(this)
+    val gestureHandler = GetFingerDataAndWrite()
     private lateinit var gestureRecognizerHelper: GestureRecognizerHelper
     private val viewModel: MainViewModel by activityViewModels()
     private var defaultNumResults = 1
@@ -528,7 +528,7 @@ class CameraFragment : Fragment(),
 
     // ── HGR text helper ───────────────────────────────────────────────
 
-    fun ChangeHGRStartedText(started: Boolean) {
+    public fun ChangeHGRStartedText(started: Boolean) {
         if (started) {
             fragmentCameraBinding.textView2.setTextColor(Color.GREEN)
             fragmentCameraBinding.textView2.text = "Hand Gesture Recognition : ON"

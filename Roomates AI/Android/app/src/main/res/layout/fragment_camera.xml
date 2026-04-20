@@ -64,6 +64,7 @@
         android:text="Hand Gesture Recognition : OFF"
         android:textColor="#FF1717"
         android:textSize="34sp"
+        android:visibility="invisible"
         app:layout_anchor="@+id/view_finder"
         app:layout_anchorGravity="bottom|center" />
 

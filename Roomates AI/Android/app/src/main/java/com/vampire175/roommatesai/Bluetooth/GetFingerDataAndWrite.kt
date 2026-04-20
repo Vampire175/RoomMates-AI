@@ -3,18 +3,19 @@ package com.vampire175.roommatesai.Bluetooth
 import android.util.Log
 import com.vampire175.roommatesai.GestureControls.fragment.CameraFragment
 
-class GetFingerDataAndWrite(private val cameraFragment: CameraFragment) {
+class GetFingerDataAndWrite() {
 
     var started: Boolean = false
 
     private var lastGestureName: String? = null
     private var lastSentTime: Long = 0L
     private val thresholdMs: Long = 500L // minimum ms between writes
+    private var startedTime:Long=0L;
 
     fun doTaskAccordingToGesture(gestureName: String?, isUserVerified: Boolean) {
         if (gestureName == null) return
 
-        started = true
+
 
         val now = System.currentTimeMillis()
         val isSameGesture = gestureName == lastGestureName
@@ -36,7 +37,12 @@ class GetFingerDataAndWrite(private val cameraFragment: CameraFragment) {
             else        -> listOf(1, 1, 1, 1, 1)
         }
 
-        if (BluetoothManager.isConnected() && isUserVerified) {
+        if(gestureName=="start"){
+            started=true
+            startedTime= System.currentTimeMillis()
+
+        }
+        if (BluetoothManager.isConnected() && isUserVerified&&started) {
             BluetoothManager.sendStates(fingerStates)
             lastGestureName = gestureName
             lastSentTime = now
@@ -44,5 +50,13 @@ class GetFingerDataAndWrite(private val cameraFragment: CameraFragment) {
         } else {
             Log.e("Gesture", "Bluetooth not connected")
         }
+
+        if(System.currentTimeMillis()-startedTime>10000){
+            started=false
+
+        }
+
+
     }
-}
+    }
+
